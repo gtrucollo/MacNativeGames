@@ -939,6 +939,7 @@ static void up_owner_check(const char *where) {
 // wait for the upload to complete after flushing it, and only then can the old queue read the upload result (mtl_read_texels waited first and flushed afterwards, the readback beat the upload, 4 failures on t_nvn upload content)
 static id<MTLCommandBuffer> q_cb(void) { if (on_sub_thread()) { up_flush(); while (atomic_load(&g_up_pending)) usleep(200); } return [g_q commandBuffer]; }
 static post_op *g_post; static int g_npost, g_postcap;
+static int report_writes_off(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_NO_REPORT_WRITE"); v = e && atoi(e); } return v; }   // bring-up aid: do not write counter / query reports into game memory
 // 每次提交一个自动释放池：提交跑在客体线程上（长驻、无运行循环、从不排空隐式池），Metal 回放里自动释放的对象
 // （命令缓冲、编码器、通道描述等）不放池就永远不释放。iOS 真机选角页实测宿主堆每帧涨约 47 个对象、0.22 MiB/s。
 // One autorelease pool per submission: submissions run on a guest thread (long-lived, no run loop, never drains the implicit pool), so objects autoreleased in the Metal replay
@@ -1955,11 +1956,11 @@ uint64_t mtl_sub_commit(void) {
                                       ops[i].sph[0], ops[i].sph[1], ops[i].sph[2], ops[i].sph[3], atomic_load(&g_occl_vis) ? " (reported as visible: occl_visible)" : "");
                 if (atomic_load(&g_occl_vis)) sum = 1u << 20;
                 nq++; nzero += sum == 0;
-                free(l); uint64_t rec[2] = {sum, gpu_ticks()}; memcpy((void *)ops[i].addr, rec, sizeof rec);
+                free(l); uint64_t rec[2] = {sum, gpu_ticks()}; if (!report_writes_off()) memcpy((void *)ops[i].addr, rec, sizeof rec);
             }
             // TOTK: NVNcounterData = {counter, timestamp}; TIMESTAMP / TIMESTAMP_TOP reports write counter 0 (the timestamp is the second word).
             // The game's conditional clears depend on that 0 (see cond_eval); other unimplemented counter types also report 0.
-            else { uint64_t t = gpu_ticks(), rec[2] = {0, t}; memcpy((void *)ops[i].addr, rec, sizeof rec); }
+            else { uint64_t t = gpu_ticks(), rec[2] = {0, t}; if (!report_writes_off()) memcpy((void *)ops[i].addr, rec, sizeof rec); }
         }
         free(ops);
         /* TOTK_OCCL_AUTODUMP=<dir>: when every occlusion query of a frame reported 0 (the game then culls all queried
@@ -2262,6 +2263,7 @@ static void pkg_owned_locked(uint64_t k) { id o = hm_get_id(&g_by_serial, &k); i
 typedef struct { tex_t t; uint64_t stamp; void *obj; } wb_ent;
 static nvn_hmap g_wb = {.klen = 8};   // serial -> wb_ent * (g_smu): rendered since the last write-back
 static _Atomic int g_wb_on = 1;
+__attribute__((constructor)) static void wb_env_init(void) { const char *e = getenv("TOTK_WRITEBACK"); if (e && !strcmp(e, "0")) atomic_store(&g_wb_on, 0); }   // bring-up aid: TOTK_WRITEBACK=0 turns the GPU-to-game-memory write-back off
 /* TOTK: fill the driver segment c0 for vertex and compute shaders (thread-group counts, uniform / storage address tables,
    point size limit; see drv_scan). TOTK_DRV_FILL=0 or "flag drvfill 0" gives them the old all-zero segment (A/B only). */
 static _Atomic int g_drvfill_on = -1;

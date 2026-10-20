@@ -2004,6 +2004,7 @@ NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h)
         return;
     }
     submit_exec(n, (const uint64_t *)h, NULL);
+    { static int w = -1; if (w < 0) { const char *e = getenv("TOTK_SUBMIT_WAIT"); w = e && atoi(e); } if (w) mtl_finish(); }   // bring-up aid: the game sees each submission completed before the call returns
     totk_tl(TL_SUB_OUT, 0, 0);
 }
 static void submit_exec(int n, const uint64_t *h, void *ucap) {

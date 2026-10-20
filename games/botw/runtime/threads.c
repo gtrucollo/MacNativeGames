@@ -128,7 +128,10 @@ static thr_t *g_core_owner[NCORE];
 static thr_t *g_core_wait;
 static int g_cores_on = -1;
 static int cores_enabled(void) { if (g_cores_on < 0) g_cores_on = getenv("TOTK_FREE_CORES") ? 0 : 1; return g_cores_on; }
-static int core_allowed(const thr_t *t, int c) { return (int)((t->mask >> c) & 1); }
+/* Bring-up aid (BOTW): TOTK_NCORES=1|2 runs the game on fewer application cores than the Switch's three, ignoring core masks, to tell
+   a race between guest threads from a host fault (1 = every guest thread takes turns on one core). */
+static int ncore_active(void) { static int n; if (!n) { const char *e = getenv("TOTK_NCORES"); n = e ? atoi(e) : NCORE; if (n < 1 || n > NCORE) n = NCORE; } return n; }
+static int core_allowed(const thr_t *t, int c) { return ncore_active() < NCORE ? c < ncore_active() : (int)((t->mask >> c) & 1); }
 static void core_grant(int c) {   // holding G: give free core c to the best waiter
     thr_t *b = NULL, **bp = NULL;
     for (thr_t **p = &g_core_wait; *p; p = &(*p)->cnext)
@@ -142,7 +145,7 @@ static void core_put(thr_t *t) {   // holding G
 }
 static void core_take(thr_t *t) {   // holding G; waits until a core in t's mask is handed over
     if (!cores_enabled() || t->cur_core >= 0) return;
-    if (!(t->mask & ((1u << NCORE) - 1))) die("thread %#x core mask %#llx has no application core", t->handle, (unsigned long long)t->mask);
+    if (ncore_active() == NCORE && !(t->mask & ((1u << NCORE) - 1))) die("thread %#x core mask %#llx has no application core", t->handle, (unsigned long long)t->mask);
     int c = t->core >= 0 && t->core < NCORE && core_allowed(t, t->core) && !g_core_owner[t->core] ? t->core : -1;
     for (int i = 0; c < 0 && i < NCORE; i++) if (core_allowed(t, i) && !g_core_owner[i]) c = i;
     if (c >= 0) { t->cur_core = c; t->core_since = now_ns(); g_core_owner[c] = t; return; }
@@ -350,6 +353,13 @@ static uint64_t yield_backoff_ns(uint64_t run_ns) {
 int svc_thread(int num, uint64_t *regs) {
     { thr_t *me = (g_keythr ? pthread_getspecific(g_keythr) : NULL); if (me) { me->last_svc = num; me->last_lr = regs[30]; me->last_fp = regs[29]; me->nsvc++; } }
 
+    {   /* bring-up aid: TOTK_TIMEOUT_SCALE=N makes every kernel wait timeout N times longer (a host stall then looks N times shorter to the game) */
+        static int scale; if (!scale) { const char *e = getenv("TOTK_TIMEOUT_SCALE"); scale = e && atoi(e) > 0 ? atoi(e) : 1; }
+        if (scale > 1) {
+            int i = num == 0x0B ? 0 : num == 0x1C ? 3 : num == 0x18 ? 3 : num == 0x34 ? 3 : -1;
+            if (i >= 0 && (int64_t)regs[i] > 0 && (int64_t)regs[i] < INT64_MAX / scale) regs[i] = (uint64_t)((int64_t)regs[i] * scale);
+        }
+    }
     switch (num) {
     case 0x08: {  // CreateThread(→w1 句柄; x1 入口, x2 参数, x3 栈顶, w4 优先级, w5 核) | CreateThread(→w1 handle; x1 entry, x2 argument, x3 stack top, w4 priority, w5 core)
         if(!regs[1]||!regs[3]||(regs[3]&15)||(int)regs[4]<28||(int)regs[4]>59||(int)regs[5]<-3||(int)regs[5]>2){regs[0]=R_BAD_STATE;return 1;}
@@ -714,6 +724,7 @@ static void dump_threads(unsigned secs) {
             }
     }
 }
+uint32_t runtime_thread_handle_self(void) { thr_t *t = g_keythr ? pthread_getspecific(g_keythr) : NULL; return t ? t->handle : 0; }   // crash report: which guest thread
 void runtime_dump_threads(void) { dump_threads(0); }   // TOTK_INPUT_FILE "threads"
 __attribute__((constructor)) static void dump_init(void) {
     const char *c = getenv("TOTK_LISTCHECK");

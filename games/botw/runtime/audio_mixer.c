@@ -479,6 +479,7 @@ static void effect_counter_add(uint32_t cpu,uint32_t *dsp,uint32_t count) {
     *dsp=next-cpu<previous?cpu-1:next;
 }
 static void mix_capture(AudioRenderer *r,int mix,const AudrenEffectIn *e) {
+    { static int off=-1; if(off<0){const char *v=getenv("TOTK_AUDIO_NO_CAPTURE");off=v&&atoi(v);} if(off)return; }   /* bring-up aid: aux capture effects do not write into game memory */
     Mixer *m=r->mixer;AudrenAuxParam p;memcpy(&p,e->specific,sizeof p);
     if(!p.send_info || !p.capacity || !p.channels)return;
     if(p.channels>24 || p.capacity>16*1024*1024)runtime_fail("capture effect dimensions");
