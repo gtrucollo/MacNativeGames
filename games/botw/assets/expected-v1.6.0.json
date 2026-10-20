@@ -1,0 +1,22 @@
+{
+  "_comment": "Hashes of the 1.6.0 source bytes, the rewritten modules and the cumulative RomFS from a genuine retail XCI (main.npdm verified by Nintendo's ACID signature). The rewrites are produced by games/totk/third_party/d2r/patch_nso.py and are not yet verified site by site; shared fonts are not pinned yet.",
+  "title_id": "01007EF00011E000",
+  "version": 786432,
+  "display_version": "1.6.0",
+  "exefs_sha256": {
+    "main": "15cfca7b89348956f85d945fade2e215a6af5991ed1071e181f97ca72f7ae20b",
+    "main.npdm": "f36df1a7b3faa617ef2a3901e26970bf04800c70ea442624b347d06202f46b1e",
+    "rtld": "e893e12a4199b0c2c15775bf03f58987fa6227923ba8a04832aabf2352d2b1b7",
+    "sdk": "754cf4b581d749fbe3d457cf66497b141ef994cf592d247919d64a37dcc30d27",
+    "subsdk0": "d22d98656a19be240b554e7db8d69126d6427232521238d665aec3509087f2cf"
+  },
+  "rewritten_sha256": {
+    "main.patched.bin": "c41ac2fa9be737f2e6b0ab641508e9a51995b03463ff6aa445ce04e5e8766a8e",
+    "sdk.patched.bin": "d950b6f1af7690231fe17e6db77d26dabf9dbf565b04774c11d7fbc605f117dd",
+    "subsdk0.patched.bin": "f5bc35332258bd850f2137c7953916dad47bd5f3ce67e5d208a1b31336c6c8da"
+  },
+  "romfs": {
+    "size": 15131979952,
+    "sha256": "89d922b7b01f09766530a601f3dcfca8bdd4e94e6387f1c1335c4f3c6662b625"
+  }
+}
