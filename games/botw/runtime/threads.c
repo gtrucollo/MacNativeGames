@@ -143,8 +143,11 @@ static void core_put(thr_t *t) {   // holding G
     if (t->cur_core < 0) return;
     int c = t->cur_core; t->cur_core = -1; t->preempt = 0; g_core_owner[c] = NULL; core_grant(c);
 }
+/* Bring-up aid: TOTK_FREE_PRIO=<n> lets threads whose priority value is below n run without waiting for a core. On Horizon a high-priority
+   thread (the render thread, 30) preempts a lower one (44) on the same core at once; here it would wait for that thread's next SVC. */
+static int free_prio_below(void) { static int n = -1; if (n < 0) { const char *e = getenv("TOTK_FREE_PRIO"); n = e ? atoi(e) : 0; } return n; }
 static void core_take(thr_t *t) {   // holding G; waits until a core in t's mask is handed over
-    if (!cores_enabled() || t->cur_core >= 0) return;
+    if (!cores_enabled() || t->cur_core >= 0 || t->prio < free_prio_below()) return;
     if (ncore_active() == NCORE && !(t->mask & ((1u << NCORE) - 1))) die("thread %#x core mask %#llx has no application core", t->handle, (unsigned long long)t->mask);
     int c = t->core >= 0 && t->core < NCORE && core_allowed(t, t->core) && !g_core_owner[t->core] ? t->core : -1;
     for (int i = 0; c < 0 && i < NCORE; i++) if (core_allowed(t, i) && !g_core_owner[i]) c = i;

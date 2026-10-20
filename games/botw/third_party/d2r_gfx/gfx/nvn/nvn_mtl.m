@@ -674,6 +674,7 @@ void mtl_pool_add(const void *mem, uint64_t size) {
 }
 
 static void stor_drop_range(uintptr_t lo, uintptr_t hi);
+static void dead_keep_drop_range(uintptr_t lo, uintptr_t hi);
 static void stor_sweep(uint64_t fence);
 void mtl_pool_del(const void *mem) {
     g_reg_gen++;
@@ -689,6 +690,7 @@ void mtl_pool_del(const void *mem) {
     }
     pthread_mutex_unlock(&g_mu);
     if (hi > lo) stor_drop_range(lo, hi);   // TOTK: storage-shared textures of this pool
+    if (hi > lo) dead_keep_drop_range(lo, hi);   // TOTK: finalized textures kept for their storage
 }
 
 static pidx_ent *pool_query(uintptr_t addr, uint64_t len) { // caller holds g_mu
@@ -1910,6 +1912,7 @@ static void chunk_maybe_split(void) {
     if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
     mtl_sub_split();
 }
+static void tiny_commit(uint64_t fence);
 uint64_t mtl_sub_commit(void) {
     cg_flush();   // TOTK: cube-face-set groups still pending at the end of the submission (reason 4 in the stats line)
     defer_fallback();   // 推迟合并通道：提交结束仍有未回放的 P 绘制（正常路径不会到这里） | Deferred merged pass: at the end of the submission there are still P draws not replayed (the normal path never gets here)
@@ -1917,6 +1920,7 @@ uint64_t mtl_sub_commit(void) {
     usnap_finish();   // TOTK: the helper threads must be done with the copies (they are, long before this)
     g_nusnap = 0;   // TOTK: the replay is done; the uniform copies stay in this submission's arena until it completes
     upd_flush();   // TOTK: renamed uniform updates reach memory here, after every draw that read them through private copies
+    tiny_commit(g_fence + 1);   // TOTK: tiny renders the CPU reads without an invalidate (BotW water colours)
     if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
     rs_sub_end();   // TOTK: encode stage drained before the command buffer is ended
     up_flush();
@@ -2238,7 +2242,7 @@ static int pkg_final_cache_on(void) {
     if (v < 0) { const char *e = getenv("TOTK_PKG_FINAL_CACHE"); v = e && atoi(e); atomic_store(&g_pkg_final_cache, v); }
     return v;
 }
-@interface NvPkg : NSObject { @public id<MTLTexture> tex; uint64_t stamp, seen, hash, owned_gen; int tracked, owned, hashed; reup_key key; uint64_t chash, csub, used; uintptr_t lo, hi; } @end   // lo / hi (TOTK): the texture's memory (pkg_orphan_report)   // tracked (TOTK): result of the last nvn_dirty_tracked   // hash：DM_NVN_DIRTYCHECK 时上传内容的全量哈希 | hash: full hash of the uploaded content under DM_NVN_DIRTYCHECK
+@interface NvPkg : NSObject { @public id<MTLTexture> tex; uint64_t stamp, seen, hash, owned_gen; int tracked, owned, hashed, dead_kept; reup_key key; uint64_t chash, csub, used; uintptr_t lo, hi; } @end   // lo / hi (TOTK): the texture's memory (pkg_orphan_report)   // tracked (TOTK): result of the last nvn_dirty_tracked   // hash：DM_NVN_DIRTYCHECK 时上传内容的全量哈希 | hash: full hash of the uploaded content under DM_NVN_DIRTYCHECK
 /* TOTK: a mirrored texture the GPU starts rendering into is told directly (g_smu held), so tex_mtl no longer asks the owned
    set again every time any other serial joins it (a locked lookup per CPU-pool texture per new render target). */
 static void pkg_owned_locked(uint64_t k) { id o = hm_get_id(&g_by_serial, &k); if ([o isKindOfClass:[NvPkg class]]) ((NvPkg *)o)->owned = 1; }
@@ -2247,10 +2251,41 @@ static void pkg_owned_locked(uint64_t k) { id o = hm_get_id(&g_by_serial, &k); i
     // The wrapper is released after its GPU readers finish. Recycle its allocation
     // with the same descriptor key as a re-upload, retaining residency. The next
     // owner overwrites every mip/layer; cached views are retired by the normal path.
+    if (dead_kept) return;   // the texture lives on in g_dead_keep, which keeps it resident
     if (!owned && pkg_final_cache_on() && reup_offer(tex, &key)) atomic_fetch_add(&g_pkg_final_kept, 1);
     else res_remove(tex);
 }
 @end
+/* TOTK (2026-10-19, BotW save pictures): the game finalizes the 854x480 capture texture after the first save, yet every later
+   save renders into it and samples it again through its texture-pool slot. Each use of a finalized serial created a texture
+   from the pool bytes and deleted it after the submission, so the render and the thumbnail drawn two frames later saw two
+   different textures, and the thumbnail read the pool bytes the GPU never wrote: a black picture. On hardware both read the
+   same memory. A texture the GPU has rendered into is now kept per storage (memory, size, layout) when its serial is
+   finalized (or when a finalized serial renders into a fresh one) and handed to the next use of a finalized serial with the
+   same storage; the entry goes when its memory pool is finalized. */
+@interface NvKeep : NSObject { @public id<MTLTexture> tex; } @end
+@implementation NvKeep
+- (void)dealloc { res_remove(tex); }
+@end
+static nvn_hmap g_dead_keep = {.klen = sizeof(stor_key)};   // stor_key -> CFBridgingRetain'ed NvKeep (g_smu)
+static id<MTLTexture> dead_keep_get(const stor_key *k) {
+    pthread_mutex_lock(&g_smu); void *v = nvn_hm_get(&g_dead_keep, k); id<MTLTexture> t = v ? ((__bridge NvKeep *)v)->tex : nil; pthread_mutex_unlock(&g_smu);
+    return t;
+}
+static void dead_keep_put(const stor_key *k, id<MTLTexture> t) {
+    NvKeep *n = [NvKeep new]; n->tex = t;
+    pthread_mutex_lock(&g_smu); void *old = nvn_hm_get(&g_dead_keep, k); nvn_hm_put(&g_dead_keep, k, (void *)CFBridgingRetain(n)); pthread_mutex_unlock(&g_smu);
+    if (old) defer_obj_release(CFBridgingRelease(old));
+}
+static void dead_keep_drop_range(uintptr_t lo, uintptr_t hi) {
+    for (;;) { stor_key k; void *v = NULL;
+        pthread_mutex_lock(&g_smu);
+        for (uint32_t i = 0; i < g_dead_keep.cap && !v; i++) if (g_dead_keep.vals[i]) { const stor_key *sk = (const stor_key *)(g_dead_keep.keys + (size_t)i * g_dead_keep.klen); if (sk->mem >= lo && sk->mem < hi) { k = *sk; v = g_dead_keep.vals[i]; } }
+        if (v) nvn_hm_del(&g_dead_keep, &k);
+        pthread_mutex_unlock(&g_smu);
+        if (!v) return;
+        defer_obj_release(CFBridgingRelease(v)); }
+}
 /* TOTK: GPU renderings into CPU-visible memory pools reach that memory when the CPU invalidates it.
    On hardware the GPU writes the texture's memory, and the game reads it back with the CPU after
    nvnMemoryPoolInvalidateMappedRange (CPU-cached pools). Here a mirrored texture the GPU renders into keeps the result
@@ -2260,7 +2295,12 @@ static void pkg_owned_locked(uint64_t k) { id o = hm_get_id(&g_by_serial, &k); i
    so the result outlives a temporary texture object finalized before the submission runs); an invalidate over its
    memory waits for the GPU and writes every level back in the NVN layout, unless the CPU has written the memory since
    the rendering (then the CPU's bytes are newer). Runtime switch: TOTK_INPUT_FILE "flag writeback 0|1" (default 1). */
-typedef struct { tex_t t; uint64_t stamp; void *obj; } wb_ent;
+/* The CPU-write check works on whole pages: a small texture shares its page with other data the CPU writes (BotW's
+   Magnesis picking renders the object under the reticle into 512-byte targets read back every frame; the page's other
+   writes skipped nearly every write-back, so the aimed object stayed red). Textures below WB_SNAP bytes keep a copy of
+   their memory taken at the rendering, and a dirty page counts as a CPU write only when those bytes changed. */
+#define WB_SNAP 65536
+typedef struct { tex_t t; uint64_t stamp; void *obj; uint8_t *snap; } wb_ent;
 static nvn_hmap g_wb = {.klen = 8};   // serial -> wb_ent * (g_smu): rendered since the last write-back
 static _Atomic int g_wb_on = 1;
 __attribute__((constructor)) static void wb_env_init(void) { const char *e = getenv("TOTK_WRITEBACK"); if (e && !strcmp(e, "0")) atomic_store(&g_wb_on, 0); }   // bring-up aid: TOTK_WRITEBACK=0 turns the GPU-to-game-memory write-back off
@@ -2364,19 +2404,64 @@ static int tilelog_match(const tex_t *t) {
     return on && t && t->d.width == w && t->d.height == h;
 }
 #define TILELOG(t, fmt, ...) do { if (tilelog_match(t)) MLOG("[tile] f%llu ser=%llu mem=%p nvnfmt=%#x lv%u " fmt, (unsigned long long)atomic_load(&g_cur_frame), (unsigned long long)(t)->serial, (void *)(t)->mem, (t)->d.format, (t)->d.levels, ##__VA_ARGS__); } while (0)
-static void wb_ent_free(wb_ent *e) { if (!e) return; if (e->obj) { defer_obj_release((__bridge id)e->obj); CFRelease(e->obj); } free(e); }
+static void wb_ent_free(wb_ent *e) { if (!e) return; if (e->obj) { defer_obj_release((__bridge id)e->obj); CFRelease(e->obj); } free(e->snap); free(e); }
+/* TOTK (2026-10-19, BotW water colours): some renders are read back by the CPU without an invalidate. BotW bakes one
+   colour per water type by drawing into a 1x1 RGBA32F target in a CPU-cached pool, flushes the range and reads the pixel
+   two frames later (main+0x147d590); on hardware the GPU wrote that memory directly, here the pixel stayed in the Metal
+   texture and the game read 0 for every water type: every pond was fully transparent. Tiny targets of this kind
+   (TINY_WB linear bytes at most) are copied into their memory as soon as the submission that rendered them completes,
+   unless the CPU changed those bytes since the rendering. Larger ones still wait for an invalidate (mtl_pool_invalidate). */
+#define TINY_WB 256
+#define TINY_MAX 16
+typedef struct { tex_t t; uint8_t *snap; size_t lp, lr; } tiny_ent;
+static tiny_ent g_tiny[TINY_MAX]; static __strong id<MTLTexture> g_tiny_tex[TINY_MAX]; static int g_ntiny;
+static void tiny_note(const tex_t *t, id o) {
+    int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
+    if (bpb <= 0 || bw != 1 || bh != 1 || t->d.levels != 1 || t->d.samples > 1 || t->d.target == 2 || t->L.layers > 1) return;
+    size_t lp = (size_t)t->d.width * bpb, lr = t->d.height;
+    if (lp * lr > TINY_WB || t->L.size > 4096) return;
+    id<MTLTexture> mt = [o isKindOfClass:[NvPkg class]] ? ((NvPkg *)o)->tex : o; if (!mt) return;
+    int i = 0; while (i < g_ntiny && g_tiny[i].t.serial != t->serial) i++;
+    if (i == g_ntiny) { if (g_ntiny == TINY_MAX) { static int said; if (!said++) MLOG("more than %d tiny GPU renders read by the CPU in one submission", TINY_MAX); return; } g_ntiny++; }
+    else free(g_tiny[i].snap);
+    g_tiny[i] = (tiny_ent){*t, malloc(t->L.size), lp, lr}; g_tiny_tex[i] = mt;
+    if (g_tiny[i].snap) memcpy(g_tiny[i].snap, t->mem, t->L.size);
+}
+static __strong id<MTLBuffer> g_tiny_buf[64];
+static void tiny_commit(uint64_t fence) {   // in mtl_sub_commit, after the last render pass: copy the tiny targets out, then into memory on completion
+    if (!g_ntiny) return;
+    id<MTLBuffer> buf = g_tiny_buf[fence % 64];
+    if (!buf) { buf = g_tiny_buf[fence % 64] = [g_dev newBufferWithLength:TINY_WB * TINY_MAX options:MTLResourceStorageModeShared]; if (!buf) MDIE("tiny write-back buffer"); res_add(buf); res_commit(); }
+    for (int i = 0; i < g_ntiny; i++) {
+        tiny_ent *e = &g_tiny[i];
+        enc_b_copy_texture_buffer(blit(), g_tiny_tex[i], 0, 0, MTLOriginMake(0, 0, 0), MTLSizeMake(e->t.d.width, e->t.d.height, 1), buf, (NSUInteger)i * TINY_WB, e->lp, e->lp * e->lr);
+        g_tiny_tex[i] = nil;
+    }
+    int n = g_ntiny; tiny_ent *l = malloc(n * sizeof *l); if (!l) MDIE("tiny write-back list"); memcpy(l, g_tiny, n * sizeof *l); g_ntiny = 0;
+    [g_commit_blocks addObject:^{
+        for (int i = 0; i < n; i++) { tiny_ent *e = &l[i]; const tex_t *t = &e->t;
+            if (e->snap && !memcmp(e->snap, t->mem, t->L.size)) {   // the CPU has not written these bytes since the rendering
+                void *tok = nvn_dirty_tracked(t->mem, t->L.size) ? nvn_dirty_gpu_write_begin(t->mem, t->L.size) : NULL;
+                if (!tok) dm_guest_write_prepare(t->mem, t->L.size);
+                if (nvn_swizzle(&t->d, 0, 0, (const uint8_t *)buf.contents + (size_t)i * TINY_WB, e->lp, t->mem)) RED_ONCE(122, "tiny write-back: unsupported layout");
+                nvn_dirty_gpu_write_end(tok);
+                TILELOG(t, "tiny write-back on completion");
+            } else TILELOG(t, "tiny write-back skipped: the CPU wrote since the render");
+            free(e->snap); }
+        free(l); }];
+}
 static void wb_note(const tex_t *t) {
     TILELOG(t, "GPU render (owned %d)", gpu_owned(t->serial));
     if (!atomic_load(&g_wb_on) || !t->mem || !t->L.size) return;
     id o = serial_get(t->serial); if (!o) return;
+    tiny_note(t, o);
     nvn_dirty_protect(t->mem, t->L.size);   // CPU writes after this rendering show up in nvn_dirty_since
     uint64_t stamp = nvn_dirty_now(), k = t->serial;
     pthread_mutex_lock(&g_smu);
     wb_ent *e = nvn_hm_get(&g_wb, &k);
-    if (e) { e->stamp = stamp; e->t = *t; pthread_mutex_unlock(&g_smu); return; }
-    e = calloc(1, sizeof *e); if (!e) MDIE("write-back record");
-    e->t = *t; e->stamp = stamp; e->obj = (void *)CFBridgingRetain(o);
-    nvn_hm_put(&g_wb, &k, e);
+    if (e) { e->stamp = stamp; e->t = *t; if (e->snap) { free(e->snap); e->snap = NULL; } }
+    else { e = calloc(1, sizeof *e); if (!e) MDIE("write-back record"); e->t = *t; e->stamp = stamp; e->obj = (void *)CFBridgingRetain(o); nvn_hm_put(&g_wb, &k, e); }
+    if (t->L.size <= WB_SNAP && (e->snap = malloc(t->L.size))) memcpy(e->snap, t->mem, t->L.size);
     pthread_mutex_unlock(&g_smu);
 }
 static int wb_level_back(const tex_t *t, id<MTLTexture> mt, unsigned level, unsigned layer) {
@@ -2431,7 +2516,8 @@ static void wb_write_list(wb_ent **list, int nl, int force) {
     /* Freshness is decided for every entry before anything is written back (a write-back marks its pages written), and
        of several renderings of the same memory (texture objects over it) only the newest is written back. */
     int fresh[512];
-    for (int i = 0; i < nl; i++) fresh[i] = force || !nvn_dirty_since(list[i]->t.mem, list[i]->t.L.size, list[i]->stamp);
+    for (int i = 0; i < nl; i++) { const wb_ent *e = list[i];
+        fresh[i] = force || !nvn_dirty_since(e->t.mem, e->t.L.size, e->stamp) || (e->snap && !memcmp(e->snap, e->t.mem, e->t.L.size)); }   // see WB_SNAP
     for (int i = 0; i < nl; i++) for (int j = 0; j < nl; j++)
         if (i != j && fresh[i] && fresh[j] && list[j]->t.mem == list[i]->t.mem && list[j]->stamp > list[i]->stamp) { fresh[i] = 2; break; }   // 2: superseded
     for (int i = 0; i < nl; i++) {
@@ -3415,8 +3501,12 @@ static id<MTLTexture> tex_mtl(const tex_t *ct) {
         TILELOG(t, "first upload from the pool bytes");
         NvPkg *npk = [NvPkg new]; pk = npk;
         pk->lo = (uintptr_t)t->mem; pk->hi = pk->lo + t->L.size;
-        pk->tex = pkg_upload(t, &pk->stamp, &pk->key);
+        stor_key dk; int dkeep = serial_is_dead(t->serial) && gpu_owned(t->serial) && stor_key_of(t, &dk);   // a finalized serial the GPU rendered into: see g_dead_keep
+        id<MTLTexture> kept = dkeep ? dead_keep_get(&dk) : nil;
+        if (kept) { pk->tex = kept; pk->stamp = nvn_dirty_now(); static uint64_t n; if (++n <= 4) MLOG("finalized serial %llu reuses the texture kept for its storage (%ux%u, %llu so far)", (unsigned long long)t->serial, t->d.width, t->d.height, (unsigned long long)n); }
+        else pk->tex = pkg_upload(t, &pk->stamp, &pk->key);
         if (!pk->tex) return nil;
+        if (dkeep) { if (!kept) dead_keep_put(&dk, pk->tex); pk->dead_kept = 1; }
         pk->seen = nvn_dirty_now(); g_pkg_uploads++; if (dirtycheck()) pk->hash = full_hash(t->mem, t->L.size);
         serial_put(t->serial, pk);
         pk->owned = gpu_owned(t->serial);   // after it is in the table: a later mark finds it there (pkg_owned_locked)
@@ -3500,6 +3590,8 @@ void mtl_pkg_stats(uint64_t *uploads, uint64_t *reuploads) { *uploads = g_pkg_up
 uint64_t mtl_pkg_miss(void) { return g_pkg_miss; }
 void mtl_tex_release(tex_t *t) {
     if (!t->serial) return;
+    { stor_key k; __unsafe_unretained id o = serial_get(t->serial);   // a mirrored texture the GPU rendered into keeps its content for later uses of this storage (g_dead_keep)
+      if ([o isKindOfClass:[NvPkg class]] && ((NvPkg *)o)->owned && ((NvPkg *)o)->tex && stor_key_of(t, &k)) { NvPkg *pk = o; if (!pk->dead_kept) dead_keep_put(&k, pk->tex); pk->dead_kept = 1; } }
     serial_del(t->serial);
     pthread_mutex_lock(&g_smu); totk_serial_add(&g_dead_serial, t->serial); ser_bump_locked(t->serial); pthread_mutex_unlock(&g_smu);   // view caches of this serial look again (dead-serial follow)
     treg_drop_serial(t->serial);
@@ -4251,6 +4343,41 @@ static void mfx_snapshot_scene(void) {
     enc_b_end(g_blit); g_blit = nil;
     g_mfx.scene_done = 1; mfx_note_scene();
 }
+/* BOTW binds one texture at two colour targets of a pass (G-buffer albedo at c1 and, write-masked off, at c2). On NVN
+   that alias is harmless; on Apple's tile GPUs each attachment has its own tile storage and both are stored at the end
+   of the pass, so the never-written one overwrites the other tile by tile (black surfaces with random squares). Keep
+   one real attachment, the one the opening draw writes (else the first), and give the other a scratch texture of the
+   same format and size that is neither loaded nor stored. Pipelines are unchanged: the formats match. */
+static uint32_t cur_chmask(void);
+static void alias_attachments(MTL4RenderPassDescriptor *pd) {
+    static id<MTLTexture> scratch[8];
+    uint32_t mask = cur_chmask();
+    for (int j = 1; j < 8; j++) {
+        MTLRenderPassColorAttachmentDescriptor *b = pd.colorAttachments[j]; if (!b.texture) continue;
+        id<MTLTexture> rb = b.texture.parentTexture ?: b.texture;
+        for (int i = 0; i < j; i++) {
+            MTLRenderPassColorAttachmentDescriptor *a = pd.colorAttachments[i]; if (!a.texture) continue;
+            id<MTLTexture> ra = a.texture.parentTexture ?: a.texture;
+            if (ra != rb || a.level != b.level || a.slice != b.slice || a.depthPlane != b.depthPlane) continue;
+            int drop = (mask >> (4 * j) & 0xf) && !(mask >> (4 * i) & 0xf) ? i : j;
+            MTLRenderPassColorAttachmentDescriptor *d = pd.colorAttachments[drop];
+            NSUInteger w = MAX(d.texture.width >> d.level, 1u), h = MAX(d.texture.height >> d.level, 1u);
+            id<MTLTexture> s = scratch[drop];
+            if (!s || s.pixelFormat != d.texture.pixelFormat || s.width != w || s.height != h) {
+                MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:d.texture.pixelFormat width:w height:h mipmapped:NO];
+                td.storageMode = MTLStorageModePrivate; td.usage = MTLTextureUsageRenderTarget;
+                id<MTLTexture> n = [g_dev newTextureWithDescriptor:td];
+                if (!n) { RED_ONCE(100, "别名附件替身贴图建不出 %lux%lu 格式 %lu", (unsigned long)w, (unsigned long)h, (unsigned long)d.texture.pixelFormat); return; }
+                res_add(n); if (s) defer_obj_release(s); scratch[drop] = s = n;
+                static int logged; if (!logged++) MLOG("[alias] colour targets %d and %d are the same texture (%lux%lu format %lu): c%d gets a scratch texture", i, j, (unsigned long)w, (unsigned long)h, (unsigned long)d.texture.pixelFormat, drop);
+            }
+            d.texture = s; d.level = 0; d.slice = 0; d.depthPlane = 0;
+            d.loadAction = MTLLoadActionDontCare; d.storeAction = MTLStoreActionDontCare;
+            PD("A %llu c%d 与 c%d 同一张贴图：c%d 换替身", g_stat_pass + 1, i, j, drop);
+            break;
+        }
+    }
+}
 static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only);
 static id<MTL4RenderCommandEncoder> rp_begin(void) { return rp_begin_ex(0); }
 static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) {
@@ -4314,6 +4441,7 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) {
             if (xe && (xe->state == XV_INVALID || xe->state == XV_PROBE)) { if (pd.colorAttachments[i].loadAction == MTLLoadActionLoad) { xv_ent copy = *xe; xv_violation(&copy, "作附件读入旧内容"); } else xv_good(xe); } }
         pd.colorAttachments[i].storeAction = MTLStoreActionStore;
     }
+    alias_attachments(pd);
     // clear_only：0 全挂 1 只为清除 2 深度模板都不挂 3 只挂模板 4 只挂深度（3 / 4 由 pass_ds_need 前瞻证明整通道只用那一项）
     // clear_only: 0 attach all 1 only for clears 2 neither depth nor stencil attached 3 stencil only 4 depth only (3 / 4: the pass_ds_need lookahead proves the whole pass uses only that one)
     if (R.rt.depth && clear_only == 3) {   // 只挂模板：合一格式的深度平面不进 tile、不读不写（Metal 允许深度附件空、模板附件挂合一贴图） | Stencil only: the depth plane of the combined format does not enter the tile and is neither read nor written (Metal allows an empty depth attachment with the combined texture on the stencil attachment)
@@ -5426,6 +5554,7 @@ static struct {
     p_poly_offset po; float vp[16][4]; float dr[2]; int has_vp; int depth_clamp; int render_disabled; int raster_discard;
     float blend_color[4]; int64_t copy_stride;
 } S;
+static uint32_t cur_chmask(void) { return S.chmask.mask; }
 static void udc_note_draw(NvProg *pr) {
     if (R.has_rt) for (int i = 0; i < R.rt.n && i < 8; i++) if (R.rt.color[i]) { zskip_del(R.rt.color[i]->serial); g_zskip_cand_ok[i] = 0; }   // 零源集合：真画了就不再是全零 | Zero-source set: once really drawn it is no longer all zeros
     /* TOTK (after D2R Mobile 44a6770): the program's image bindings and fragment colour mask are worked out once per program
