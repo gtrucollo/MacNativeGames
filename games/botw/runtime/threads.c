@@ -26,6 +26,7 @@
 #include <errno.h>
 #include <sched.h>
 #include <signal.h>
+#include <unistd.h>
 #include <sys/mman.h>
 #include <time.h>
 #include <mach/mach.h>
@@ -61,6 +62,10 @@ typedef struct thr {
     uint32_t qos;
     int cur_core;              // virtual core held while running guest code, -1 while blocked / not started
     int preempt;               // a higher-priority thread waits for this thread's core
+    uint64_t preempt_ns;       // when the flag was first set (core_monitor forces the switch if no SVC comes)
+    int boost;                 // priority inherited from a higher-priority thread blocked on a mutex this thread holds (core_monitor; 0 = none)
+    uint64_t cwait_ns;         // when the thread started waiting for a core
+    int susp;                  // taken off its core while running guest code (thread_suspend); core_grant resumes it
     uint64_t cseq, core_since; struct thr *cnext;
     uint32_t wh[4]; int nwh;   // handles of the current WaitSynchronization (state dump)
     int last_hle;              // 1 + wrapper index of the last host call made while "hletrace" was on (state dump)
@@ -132,16 +137,18 @@ static int cores_enabled(void) { if (g_cores_on < 0) g_cores_on = getenv("TOTK_F
    a race between guest threads from a host fault (1 = every guest thread takes turns on one core). */
 static int ncore_active(void) { static int n; if (!n) { const char *e = getenv("TOTK_NCORES"); n = e ? atoi(e) : NCORE; if (n < 1 || n > NCORE) n = NCORE; } return n; }
 static int core_allowed(const thr_t *t, int c) { return ncore_active() < NCORE ? c < ncore_active() : (int)((t->mask >> c) & 1); }
+static int eprio(const thr_t *t) { return t->boost && t->boost < t->prio ? t->boost : t->prio; }   // priority for choosing who gets a core
 static void core_grant(int c) {   // holding G: give free core c to the best waiter
     thr_t *b = NULL, **bp = NULL;
     for (thr_t **p = &g_core_wait; *p; p = &(*p)->cnext)
-        if (core_allowed(*p, c) && (!b || (*p)->prio < b->prio || ((*p)->prio == b->prio && (*p)->cseq < b->cseq))) { b = *p; bp = p; }
+        if (core_allowed(*p, c) && (!b || eprio(*p) < eprio(b) || (eprio(*p) == eprio(b) && (*p)->cseq < b->cseq))) { b = *p; bp = p; }
     if (!b) return;
     *bp = b->cnext; b->cnext = NULL; b->cur_core = c; b->core_since = now_ns(); g_core_owner[c] = b; pthread_cond_signal(&b->cv);
+    if (b->susp) { b->susp = 0; thread_resume(b->mport); }   // preempted in guest code by core_monitor
 }
 static void core_put(thr_t *t) {   // holding G
     if (t->cur_core < 0) return;
-    int c = t->cur_core; t->cur_core = -1; t->preempt = 0; g_core_owner[c] = NULL; core_grant(c);
+    int c = t->cur_core; t->cur_core = -1; t->preempt = 0; t->preempt_ns = 0; g_core_owner[c] = NULL; core_grant(c);
 }
 /* Bring-up aid: TOTK_FREE_PRIO=<n> lets threads whose priority value is below n run without waiting for a core. On Horizon a high-priority
    thread (the render thread, 30) preempts a lower one (44) on the same core at once; here it would wait for that thread's next SVC. */
@@ -152,9 +159,49 @@ static void core_take(thr_t *t) {   // holding G; waits until a core in t's mask
     int c = t->core >= 0 && t->core < NCORE && core_allowed(t, t->core) && !g_core_owner[t->core] ? t->core : -1;
     for (int i = 0; c < 0 && i < NCORE; i++) if (core_allowed(t, i) && !g_core_owner[i]) c = i;
     if (c >= 0) { t->cur_core = c; t->core_since = now_ns(); g_core_owner[c] = t; return; }
-    t->cseq = ++g_wseq; t->cnext = g_core_wait; g_core_wait = t;
-    for (int i = 0; i < NCORE; i++) if (core_allowed(t, i) && g_core_owner[i] && g_core_owner[i]->prio > t->prio) g_core_owner[i]->preempt = 1;
+    t->cseq = ++g_wseq; t->cwait_ns = now_ns(); t->cnext = g_core_wait; g_core_wait = t;
+    for (int i = 0; i < NCORE; i++) if (core_allowed(t, i) && g_core_owner[i] && g_core_owner[i]->prio > t->prio) { g_core_owner[i]->preempt = 1; if (!g_core_owner[i]->preempt_ns) g_core_owner[i]->preempt_ns = now_ns(); }
     while (t->cur_core < 0) pthread_cond_wait(&t->cv, &G);
+}
+
+/* Forced preemption. Horizon's timer interrupt switches to a higher-priority thread at once; here a core owner only gives its core up at
+   an SVC. A guest thread that spins in guest code (BOTW polls a flag with a spin lock, no SVC) kept its core for ever while the render
+   thread (priority 30) waited for it: the picture froze. When a higher-priority waiter has wanted a core for 2 ms and its owner is in
+   guest code, the owner is suspended where it is, the core goes to the waiter, and the owner is resumed when a core is handed back to it. */
+__attribute__((weak)) int runtime_pc_in_guest(uint64_t pc) { (void)pc; return 0; }
+static void *core_monitor(void *arg) {
+    (void)arg;
+    for (;;) {
+        usleep(1000);
+        pthread_mutex_lock(&G);
+        uint64_t now = now_ns();
+        /* Priority inheritance (Horizon's ArbitrateLock): a thread blocked on a mutex lends its priority to the holder. */
+        for (thr_t *t = g_all; t; t = t->all) t->boost = 0;
+        for (thr_t *t = g_all; t; t = t->all) {
+            if (t->wkind != 1 || !t->waddr || t->exited) continue;
+            uint32_t holder = *(volatile uint32_t *)(uintptr_t)t->waddr & ~0x40000000u;
+            for (thr_t *h = g_all; h; h = h->all) if (h->handle == holder && h->prio > t->prio && (!h->boost || t->prio < h->boost)) h->boost = t->prio;
+        }
+        /* a waiter that has wanted a core for 3 ms marks its owner for preemption: a strictly higher priority, or an inherited one */
+        for (thr_t *w = g_core_wait; w; w = w->cnext) {
+            if (now - w->cwait_ns < 3000000) continue;
+            for (int c = 0; c < NCORE; c++) { thr_t *o = g_core_owner[c];
+                if (o && core_allowed(w, c) && (eprio(w) < o->prio || (w->boost && eprio(w) <= o->prio))) { o->preempt = 1; if (!o->preempt_ns) o->preempt_ns = now; } }
+        }
+        for (int c = 0; c < NCORE; c++) {
+            thr_t *o = g_core_owner[c];
+            if (!o || !o->preempt || o->susp || !o->mport || now - o->preempt_ns < 2000000) continue;
+            arm_thread_state64_t st; mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+            if (thread_suspend(o->mport) != KERN_SUCCESS) continue;
+            if (thread_get_state(o->mport, ARM_THREAD_STATE64, (thread_state_t)&st, &cnt) != KERN_SUCCESS || !runtime_pc_in_guest(arm_thread_state64_get_pc(st))) { thread_resume(o->mport); o->preempt_ns = now; continue; }
+            static int said; if (said++ < 8) fprintf(stderr, "[totk] core %d: guest thread %#x (prio %d) took its core while spinning; handed to a higher-priority waiter\n", c, o->handle, o->prio);
+            o->susp = 1; o->preempt = 0; o->preempt_ns = 0; o->cur_core = -1; g_core_owner[c] = NULL;
+            o->cseq = ++g_wseq; o->cnext = g_core_wait; g_core_wait = o;
+            core_grant(c);
+        }
+        pthread_mutex_unlock(&G);
+    }
+    return NULL;
 }
 static thr_t *me_or_null(void) { return g_keythr ? pthread_getspecific(g_keythr) : NULL; }
 void runtime_thread_note_hle(unsigned i) { thr_t *t = me_or_null(); if (t) t->last_hle = (int)i + 1; }   // hle_stack.c, while tracing
@@ -171,7 +218,7 @@ void runtime_core_back(int *away) {
 // Preemption point at SVC entry: a higher-priority thread waits for this core.
 void runtime_core_checkpoint(void) {
     thr_t *t = me_or_null(); if (!t || !t->preempt) return;
-    pthread_mutex_lock(&G); t->preempt = 0; core_put(t); core_take(t); pthread_mutex_unlock(&G);
+    pthread_mutex_lock(&G); t->preempt = 0; t->preempt_ns = 0; core_put(t); core_take(t); pthread_mutex_unlock(&G);
 }
 int runtime_current_core(void) { thr_t *t = me_or_null(); return t ? (t->cur_core >= 0 ? t->cur_core : t->core) : -1; }
 
@@ -723,13 +770,19 @@ static void dump_threads(unsigned secs) {
                 char a[96], b[96]; runtime_describe_address(arm_thread_state64_get_pc(st), a, sizeof a); runtime_describe_address(arm_thread_state64_get_lr(st), b, sizeof b);
                 fprintf(stderr, "    live pc=%s lr=%s x0=%#llx x1=%#llx x8=%#llx\n", a, b, (unsigned long long)st.__x[0], (unsigned long long)st.__x[1], (unsigned long long)st.__x[8]);
                 dump_chain(arm_thread_state64_get_lr(st), arm_thread_state64_get_fp(st));
+                { uint32_t w[8]; mach_vm_size_t got = 0; uint64_t lk = st.__x[8];   // the word x8 points at (a spin lock in BOTW's ring code) and the ones around it
+                  if (lk >= 16 && mach_vm_read_overwrite(mach_task_self(), lk - 16, 32, (mach_vm_address_t)(uintptr_t)w, &got) == KERN_SUCCESS && got == 32)
+                      fprintf(stderr, "    [x8-16..x8+16] %08x %08x %08x %08x | %08x %08x %08x %08x\n", w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]); }
                 usleep(20000);
             }
     }
 }
 uint32_t runtime_thread_handle_self(void) { thr_t *t = g_keythr ? pthread_getspecific(g_keythr) : NULL; return t ? t->handle : 0; }   // crash report: which guest thread
 void runtime_dump_threads(void) { dump_threads(0); }   // TOTK_INPUT_FILE "threads"
+static void usr1_dump(int sig) { (void)sig; dump_threads(0); }   // kill -USR1: what every guest thread is doing (a stalled run)
 __attribute__((constructor)) static void dump_init(void) {
+    signal(SIGUSR1, usr1_dump);
+    if (!getenv("TOTK_NO_FORCED_PREEMPT")) { pthread_t mt; pthread_create(&mt, NULL, core_monitor, NULL); pthread_detach(mt); }
     const char *c = getenv("TOTK_LISTCHECK");
     if (c) { pthread_t th; pthread_create(&th, NULL, list_check, (void *)(uintptr_t)strtoull(c, NULL, 0)); pthread_detach(th); }
     const char *e = getenv("TOTK_DUMP_AFTER"); if (!e) return;

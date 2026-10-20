@@ -119,6 +119,7 @@ int runtime_module_query(uint64_t address,uint64_t *base,uint64_t *size,unsigned
  }
  return 0;
 }
+int runtime_pc_in_guest(uint64_t pc){for(unsigned i=0;i<NM;i++)if(pc>=(uintptr_t)modules[i].base&&pc<(uintptr_t)modules[i].base+modules[i].size)return 1;return 0;}   /* threads.c core_monitor: only a thread in guest code may be suspended */
 void runtime_describe_address(uint64_t a,char *out,size_t n){for(unsigned i=0;i<NM;i++)if(a>=(uintptr_t)modules[i].base&&a<(uintptr_t)modules[i].base+modules[i].size){snprintf(out,n,"%s+0x%llx",modules[i].name,(unsigned long long)(a-(uintptr_t)modules[i].base));return;}Dl_info di;if(dladdr((void *)(uintptr_t)a,&di)&&di.dli_sname){snprintf(out,n,"%s+0x%llx",di.dli_sname,(unsigned long long)(a-(uintptr_t)di.dli_saddr));return;}snprintf(out,n,"0x%llx",(unsigned long long)a);}
 /* Guest frame-pointer chain. Guest threads run on guest stacks (not the host pthread stack), so frames are read with
    mach_vm_read_overwrite (a bad pointer ends the walk instead of faulting); the chain must grow upwards. */
