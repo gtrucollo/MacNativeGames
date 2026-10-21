@@ -82,7 +82,11 @@ static void frame_step_report(uint64_t now_ns) {
     if (!report_ns) { report_ns = now_ns; return; }
     if (now_ns - report_ns < 30000000000ull) return;
     float ratio = -1, delta = -1;
+#ifdef GAME_BOTW190
+    uint64_t vfr = 0;   /* the 1.6.0 singleton slot; 1.9.0 keeps it elsewhere, the report shows -1 for the game's own values */
+#else
     uint64_t vfr = *(const uint64_t *)(const void *)(frame_step_main + VFR_INSTANCE);
+#endif
     if (vfr) {
         memcpy(&ratio, (const void *)(uintptr_t)(vfr + VFR_RATIO), 4);
         uint64_t p = *(const uint64_t *)(uintptr_t)(vfr + VFR_DELTA_TIME);
