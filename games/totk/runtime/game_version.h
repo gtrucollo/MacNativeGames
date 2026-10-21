@@ -4,7 +4,24 @@
 #pragma once
 #define GAME_ADDR_JOIN(x) GAME_ADDR_##x
 #define GAME_ADDR(x) GAME_ADDR_JOIN(x)
-#if defined(GAME_BOTW160)
+#if defined(GAME_BOTW190)
+/* The Legend of Zelda: Breath of the Wild 1.9.0: a different build of the game from 1.6.0 (other compiler, other libraries), so
+   none of the 1.6.0 addresses apply. game_patches_botw.c keeps only the patches that do not depend on addresses until the
+   quality-of-life sites are found again. */
+#ifndef GAME_BOTW
+#define GAME_BOTW 1
+#endif
+#define TOTK_GAME_VERSION "1.9.0"
+#define GAME_NAME "Breath of the Wild"
+#define GAME_FOLDER "BotW"
+#define GAME_LOG "botw"
+#define GAME_CONTRIB_TEMPLATE "shader-list-botw.yml"
+#define GAME_CONTRIB_TITLE "Shader list (Breath of the Wild):"
+#define TOTK_GAME_DIR "botw190"
+#define GAME_ADDR_0xe995c4 0xc617e8   /* return address of nnMain's only call to nn::oe::SetFocusHandlingMode */
+#define GAME_ADDR_0x2aa4fa0 0x15a01a0 /* nn::swkbd::ShowKeyboard: main's PLT stub */
+#define GAME_ADDR_0x453f648 0x1d78198 /* nn::swkbd::ShowKeyboard: main's GOT slot */
+#elif defined(GAME_BOTW160)
 /* The Legend of Zelda: Breath of the Wild 1.6.0 (botw.md). The TOTK patch sites do not exist here: game_patches_botw.c replaces
    game_patches.c, and the shared code that uses TOTK addresses is compiled out with GAME_BOTW. */
 #ifndef GAME_BOTW

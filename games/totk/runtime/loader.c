@@ -489,14 +489,14 @@ void runtime_startup_checkpoint(uintptr_t caller) {
  for(unsigned i=0;i<NM;i++){uint32_t state;memcpy(&state,modules[i].base+modules[i].ctor_flag,4);need(state==2,"constructor checkpoint state");}
  printf("{\"status\":\"pass\",\"phase\":4,\"original_nnMain_return_pc\":\"0x%x\",\"scope\":\"all DT_INIT constructor loops completed; original nnMain prefix executed; stops at focus setup\"}\n", GAME_ADDR(0xe995c4));fflush(stdout);_exit(0);
 }
-#ifndef GAME_BOTW
+#if !defined(GAME_BOTW) || defined(GAME_BOTW190)
 static void module_finis(void) { runtime_fail("guest exited: module finalizers not yet implemented"); }
 #endif
 static void boot(void) {
  fprintf(stderr,"[totk] game version %s\n", TOTK_GAME_VERSION);
  runtime_boot_status(TOTK_UI("启动游戏运行环境","Starting the game runtime"),TOTK_UI("连接游戏代码与 macOS 系统服务","Connecting the game code to macOS system services"));
  runtime_thread_init();uint32_t main_handle=svc_thread_main_init();
-#ifdef GAME_BOTW
+#if defined(GAME_BOTW) && !defined(GAME_BOTW190)   /* 1.9.0's SDK has the five-argument Start, like TOTK's */
  /* SDK 7.3.2 (Breath of the Wild): Start(handle, arg, rtld callback, module initializers). The order inside is the one of
     TOTK's SDK 15 (libc0, nnosInitialize, callback, libc1, InitializeSdkModule, nninitStartup, libc2, callback, nnMain), but
     after nnMain it calls nninitFinalizeSdkModule and quick-exits itself instead of a third callback. */

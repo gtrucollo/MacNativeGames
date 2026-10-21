@@ -10,6 +10,14 @@
 #include "game_version.h"
 uint32_t runtime_thread_current_handle(void);
 
+/* 1080p and the real-time frame step have their sites in both builds. The pad repeat loop and the pause menu countdown are the
+   1.6.0 per-frame code; 1.9.0 counts them in real time itself, and the job-queue diagnostics are 1.6.0 addresses. */
+#ifdef GAME_BOTW190
+enum { SITES_KNOWN = 1, PAD_SITES = 0 };
+#else
+enum { SITES_KNOWN = 1, PAD_SITES = 1 };
+#endif
+
 /* Real-time frame step (TOTK_REALTIME=0: as shipped). ksys::VFR (singleton pointer main+0x2d1e170, built at main+0x183eb98)
    keeps one frame ratio at +0x3c: the frame's length in 30 fps frames. Every per-core step the game reads derives from it:
    delta frames (+0x108, about 1,500 readers) = time-speed multiplier x ratio, delta time (+0x138) = that x 1/30 s (+0x158).
@@ -259,6 +267,18 @@ static void patch_realtime(Module *m) {
     uint64_t data_off = (m->file_size + 0x3fff) & ~0x3fffULL;
     if (data_off + 0x4000 != m->size || data_off & 0xfff) runtime_fail("real-time frame-step page layout");
     /* Every word of both sequences, the replaced ones and their neighbours, must be the 1.6.0 original. */
+#ifdef GAME_BOTW190
+    /* 1.9.0: the VFR update is main+0x151d484 (fcmp -> adrp x9, b.eq -> ldr s1, [x9]; x9 is loaded again after it). The fade and
+       the UI step call the interval getter (main+0x583118: max(interval, 1) of this core) and halve it: the call becomes
+       adrp x8 / ldr s0, [x8] (x0 and s0 are the only results used), the halving a nop. */
+    static const struct { uint32_t off, original; } check[] = {
+        {0x151d484u, 0x1e202020u}, {0x151d488u, 0x3900a268u}, {0x151d48cu, 0x54000040u}, {0x151d490u, 0xbd003e61u},
+        {0x125f114u, 0x97cc9001u}, {0x125f118u, 0x1e230000u}, {0x125f11cu, 0x1e2c1001u}, {0x125f120u, 0xd0002208u},
+        {0x125f128u, 0x1e210800u}, {0x125f12cu, 0xbd417101u},
+        {0x1280ec8u, 0x97cc0894u}, {0x1280eccu, 0x1e230000u}, {0x1280ee0u, 0xf9400268u}, {0x1280ee4u, 0x1e210800u}, {0x1280ee8u, 0xbd0b2100u},
+        {0x1281068u, 0xf94002a0u}, {0x128106cu, 0x1e204009u}, {0x1281070u, 0x97ccd7ceu},
+    };
+#else
     static const struct { uint32_t off, original; } check[] = {
         {0x1c0120cu, 0x1e202020u}, {0x1c01210u, 0x3900a008u}, {0x1c01214u, 0x54000060u}, {0x1c01218u, 0xbd003c01u},
         {0x1821564u, 0xf9400108u}, {0x1821568u, 0xb9400108u}, {0x182156cu, 0x7100011fu}, {0x1821570u, 0x1a9f1508u},
@@ -268,15 +288,26 @@ static void patch_realtime(Module *m) {
         {0x18522fcu, 0x1e2c1001u}, {0x1852300u, 0x1e210800u}, {0x1852304u, 0xbd0b22a0u},
         {0x161847cu, 0x1e290908u}, {0x1618480u, 0xbd400109u}, {0x1618484u, 0xb94c3680u},
     };
+#endif
     for (size_t i = 0; i < sizeof check / sizeof *check; i++) {
         uint32_t w; memcpy(&w, m->base + check[i].off, 4);
         if (w != check[i].original) {
             fprintf(stderr, "[botw] real-time frame step main+%#x: found %08x expected %08x\n", check[i].off, w, check[i].original);
-            runtime_fail("real-time frame step requires the 1.6.0 VFR update instructions");
+            runtime_fail("real-time frame step requires the shipped VFR update instructions");
         }
     }
     const uint64_t page = (uintptr_t)m->base + data_off;
     const uint32_t nop = 0xd503201fu;
+#ifdef GAME_BOTW190
+    const struct { uint32_t off, word; } put[] = {
+        {0x151d484u, adrp_reg(9, (uintptr_t)m->base + 0x151d484, page)}, {0x151d48cu, 0xbd400121u},   /* ldr s1, [x9] */
+        {0x125f114u, adrp_reg(8, (uintptr_t)m->base + 0x125f114, page)}, {0x125f118u, 0xbd400100u},   /* ldr s0, [x8] */
+        {0x125f128u, nop},
+        {0x1280ec8u, adrp_reg(8, (uintptr_t)m->base + 0x1280ec8, page)}, {0x1280eccu, 0xbd400100u},   /* ldr s0, [x8] */
+        {0x1280ee4u, nop},
+        {0x128106cu, 0x1e2e1009u},   /* fmov s9, #1.0: six physics substeps per frame at any frame rate */
+    };
+#else
     const struct { uint32_t off, word; } put[] = {
         {0x1c0120cu, adrp_reg(9, (uintptr_t)m->base + 0x1c0120c, page)}, {0x1c01214u, 0xbd400121u},   /* ldr s1, [x9] */
         {0x1821568u, adrp_reg(8, (uintptr_t)m->base + 0x1821568, page)}, {0x182156cu, 0xbd400100u},   /* ldr s0, [x8] */
@@ -285,6 +316,7 @@ static void patch_realtime(Module *m) {
         {0x18522f4u, nop}, {0x18522f8u, nop}, {0x1852300u, nop},
         {0x1618480u, 0x1e2e1009u},   /* fmov s9, #1.0: six physics substeps per frame at any frame rate */
     };
+#endif
     for (size_t i = 0; i < sizeof put / sizeof *put; i++) memcpy(m->base + put[i].off, &put[i].word, 4);
     frame_step_main = m->base;
     frame_step_data = (_Atomic uint64_t *)(void *)(m->base + data_off);
@@ -292,7 +324,7 @@ static void patch_realtime(Module *m) {
     fprintf(stderr, "[botw] real-time frame step: the VFR ratio, one interval-stepped fade and the UI animation step follow the measured frame time, physics keeps six substeps a frame "
                     "(%zu instructions, %zu verified); initial 33.33 ms, sampled at each present (TOTK_REALTIME=0: as shipped)\n",
             sizeof put / sizeof *put, sizeof check / sizeof *check);
-    patch_pad_repeat(m, page);
+    if (PAD_SITES) patch_pad_repeat(m, page);
 }
 /* Diagnostics (TOTK_JQ_CHECK=1): random crashes look like one job run twice (two threads in the same skinning job, a list
    item consumed twice). brk instructions replace a few instructions of sead::JobQueue::run (main+0x12c0dc0) and of the
@@ -354,9 +386,17 @@ static unsigned excl_acquire(uint8_t *code, size_t n) {
 static void patch_render_1080(Module *m) {
     const char *e = getenv("TOTK_RENDER_RES");
     if (e && !strcmp(e, "900")) { fprintf(stderr, "[botw] docked render size 1600x900, as shipped (TOTK_RENDER_RES=900)\n"); return; }
+#ifdef GAME_BOTW190
+    enum { RENDER_MOVK = 0x12660c8 };   /* the pair is stored at +0x1210 in 1.9.0 */
+    static const struct { uint32_t off, original; } check[] = {
+        {0x12660bcu, 0xd2a89e08u}, {0x12660c8u, 0xf2e89908u}, {0x12660ccu, 0xf9090a68u},
+    };
+#else
+    enum { RENDER_MOVK = 0x1821674 };
     static const struct { uint32_t off, original; } check[] = {
         {0x1821670u, 0xd2a89e08u}, {0x1821674u, 0xf2e89908u}, {0x1821678u, 0xf9094b88u},
     };
+#endif
     for (size_t i = 0; i < sizeof check / sizeof *check; i++) {
         uint32_t w; memcpy(&w, m->base + check[i].off, 4);
         if (w != check[i].original) {
@@ -365,20 +405,21 @@ static void patch_render_1080(Module *m) {
         }
     }
     const uint32_t movk = 0xf2e89e08u;   /* movk x8, #0x44f0, lsl #48 */
-    memcpy(m->base + 0x1821674u, &movk, 4);
+    memcpy(m->base + RENDER_MOVK, &movk, 4);
     fprintf(stderr, "[botw] docked render size 1920x1080 (shipped: 1600x900; TOTK_RENDER_RES=900 keeps it)\n");
 }
 void runtime_game_patches(Module *m) {
     fprintf(stderr, "[botw] %s game-code patches\n", TOTK_GAME_VERSION);
-    patch_render_1080(m);
-    if (realtime_enabled()) patch_realtime(m);
+    if (SITES_KNOWN) patch_render_1080(m);
+    if (!SITES_KNOWN) {}
+    else if (realtime_enabled()) patch_realtime(m);
     else fprintf(stderr, "[botw] real-time frame step off (TOTK_REALTIME=0): the game advances by its present interval\n");
     { const char *a = getenv("TOTK_EXCL_ACQUIRE");
       if (!a || strcmp(a, "0")) {
           unsigned t = excl_acquire(m->base, m->text_end), p = excl_acquire(m->base + m->patch_off, m->file_size - m->patch_off);
           fprintf(stderr, "[botw] exclusive loads with acquire: %u in the code, %u in the rewriter's patch area (TOTK_EXCL_ACQUIRE=0: as shipped)\n", t, p);
       } else fprintf(stderr, "[botw] exclusive loads as shipped (TOTK_EXCL_ACQUIRE=0)\n"); }
-    const char *e = getenv("TOTK_JQ_CHECK"); if (!e || !*e || !strcmp(e, "0")) return;
+    const char *e = getenv("TOTK_JQ_CHECK"); if (!PAD_SITES || !e || !*e || !strcmp(e, "0")) return;
     for (int i = 0; i < JQ_SITES; i++) { uint32_t w; memcpy(&w, m->base + g_jq_site[i].off, 4);
         if (w != g_jq_site[i].word) { fprintf(stderr, "[botw] TOTK_JQ_CHECK: main+%#x is %08x, not %08x (%s): not armed\n", g_jq_site[i].off, w, g_jq_site[i].word, g_jq_site[i].what); return; } }
     for (int i = 0; i < JQ_SITES; i++) { uint32_t b = 0xd4200000u | ((0x7a1u + (uint32_t)i) << 5); memcpy(m->base + g_jq_site[i].off, &b, 4); }
@@ -497,6 +538,9 @@ uint64_t runtime_output_res_extra_bytes(void) { return 0; }
    TOTK_MOVIE_30=0 turns it off. */
 int runtime_game_fps_limit(void) {
     static int on = -1; if (on < 0) { const char *e = getenv("TOTK_MOVIE_30"); on = !(e && !strcmp(e, "0")); }
+#ifdef GAME_BOTW190
+    return 0;   /* 1.9.0 keeps its movie object elsewhere: the word is not located yet, movies are not held at 30 fps */
+#endif
     if (!on || !frame_step_main) return 0;
     uint64_t movie; memcpy(&movie, frame_step_main + 0x2cbef40, 8);
     static int was; if (!!movie != was) { was = !!movie; fprintf(stderr, "[botw] movie %s: frame pacing %s\n", was ? "starts" : "ends", was ? "held at 30 fps" : "back to normal"); }

@@ -1,3 +1,8 @@
+/* Breath of the Wild 1.6.0 is built against NVN 53, 1.9.0 against NVN 55.15 like Tears of the Kingdom: only 1.6.0 gets the NVN 53
+   behaviour (command handles that name a position in control memory, API version 53.311). */
+#if defined(GAME_BOTW) && !defined(GAME_BOTW190)
+#define GAME_NVN53 1
+#endif
 #include <malloc/malloc.h>
 // NVN 接口层：接管 main 导入的 nvnBootstrapLoader，sdk 里的 NVN 驱动整块不执行。
 // 523 个 NVN 名字一律返回计数跳板（nvn_thunks.S），跳板再转到这里的实现：
@@ -150,7 +155,7 @@ NVN(nvnDeviceGetProcAddress, PFNNVNGENERICFUNCPTRPROC, const NVNdevice *d, const
 // 设备属性：Tegra X1 实测值（nnheaders nvn_DeviceConstantsNX.h，在 SMO 上逐项调 nvnDeviceGetInteger 得到）
 // Device properties: values measured on Tegra X1 (nnheaders nvn_DeviceConstantsNX.h, obtained by calling nvnDeviceGetInteger item by item on SMO)
 static const int g_devinfo[] = {
-#ifdef GAME_BOTW
+#ifdef GAME_NVN53
     [0x00] = 53, [0x01] = 311,  // Breath of the Wild 1.6.0 main+0xe55304 requires major 53, minor >= 311 (botw.md).
 #else
     [0x00] = 55, [0x01] = 15,   // Experimental ABI target: TOTK main+e9d614 requires major 55, minor >= 15. Unsupported functions stop.
@@ -789,7 +794,7 @@ NVN(nvnCommandBufferAddCommandMemory, void, NVNcommandBuffer *c, const NVNmemory
 // The SDK encodes handles in control memory (sdk+0x444530). Reusing that storage retires its copies.
 NVN(nvnCommandBufferAddControlMemory, void, NVNcommandBuffer *c, void *m, size_t n) {
     if (cmdlog_env()) LOG("[cmd] AddControlMemory cb=%p mem=%p size=%#zx", (void *)c, m, n);
-#ifndef GAME_BOTW   /* NVN 53 handles do not live in control memory: Breath of the Wild re-adds a command buffer's control memory and keeps calling handles recorded before (botw.md) */
+#ifndef GAME_NVN53   /* NVN 53 handles do not live in control memory: Breath of the Wild re-adds a command buffer's control memory and keeps calling handles recorded before (botw.md) */
     release_copies((uintptr_t)m, (uintptr_t)m + n);
 #endif
     CB(c)->ctl = m; CB(c)->ctl_size = n; CB(c)->ctl_used = 0;
@@ -886,7 +891,7 @@ static copy_bucket *cbk_get(uintptr_t page, int create) {   // g_copy_mu held
 static pthread_mutex_t g_copy_mu = PTHREAD_MUTEX_INITIALIZER;
 /* The opaque handle points past this host-only validation and accounting prefix. */
 #define COPY_MAGIC 0x59504f43444d43ull   /* "CMDCOPY" */
-#ifdef GAME_BOTW
+#ifdef GAME_NVN53
 typedef struct { uint64_t magic; _Atomic uint64_t used_at; uint64_t made_at; uint32_t body_bytes, last_size; _Atomic uint32_t used; uint32_t pad_; } copy_prefix;   // used: called or submitted at least once (NVN 53 lifetime, release_copies)
 #else
 typedef struct { uint64_t magic; _Atomic uint64_t used_at; uint64_t made_at; uint32_t body_bytes, last_size; } copy_prefix;
@@ -910,7 +915,7 @@ static uint8_t *flatten_recording(const uint8_t *p) {
         if (h.op == OP_END) {
             uint8_t *trimmed = realloc(out, n); if (trimmed) out = trimmed;
             copy_prefix *c = (copy_prefix *)out; c->magic = COPY_MAGIC; c->used_at = 0; c->made_at = g_submits;
-#ifdef GAME_BOTW
+#ifdef GAME_NVN53
             c->used = 0;
 #endif
             size_t body = n >= sizeof(copy_prefix) + 16 ? n - sizeof(copy_prefix) - 16 : 0;
@@ -932,7 +937,7 @@ static void copy_touch(NVNcommandHandle h, uint64_t now) {
         die("command handle %#llx is not a live recording (freed or never recorded)", (unsigned long long)h);
     }
     c->used_at = now;
-#ifdef GAME_BOTW
+#ifdef GAME_NVN53
     c->used = 1;
 #endif
 }
@@ -956,7 +961,7 @@ static void release_copies(uintptr_t lo, uintptr_t hi) {
         for (uint32_t i = 0; i < b->n;) {
             cmd_copy *c = &b->v[i];
             if (!(c->ctl_lo < hi && lo < c->ctl_hi)) { i++; continue; }
-#ifdef GAME_BOTW
+#ifdef GAME_NVN53
             /* NVN 53 (botw.md): a recording the game has not used yet stays, though the command memory it went into is handed
                out again: Breath of the Wild recycles its 512-byte command chunks within a frame and calls such handles later
                in the same frame (boot37 / boot38). Once used, a recycled chunk retires it. */
@@ -1020,7 +1025,7 @@ NVN(nvnCommandBufferEndRecording, NVNcommandHandle, NVNcommandBuffer *c) {
     uint8_t *copy = flatten_recording(o->seg);
     if (call_stats_on()) call_stats_end(c, copy);
     /* Finalizing the recorder does not retire its handle; only reusing the backing control region does. */
-#ifdef GAME_BOTW
+#ifdef GAME_NVN53
     /* NVN 53 (Breath of the Wild, botw.md): the handle is the recording's position in the command buffer's control memory,
        as the original driver returns a descriptor address there. The game records into the same control memory position
        frame after frame and keeps calling the handle value it got once: it means "what was last recorded here". So the
@@ -1039,7 +1044,7 @@ NVN(nvnCommandBufferEndRecording, NVNcommandHandle, NVNcommandBuffer *c) {
     if (token) copy_token_write(lo, copy);
     pthread_mutex_lock(&g_copy_mu);
     { copy_bucket *b = cbk_get(lo >> COPY_PAGE_SHIFT, 1);
-#ifdef GAME_BOTW
+#ifdef GAME_NVN53
       if (lo) for (uint32_t i = 0; i < b->n; i++) if (b->v[i].ctl_lo == lo) { copy_drop(b, i, 0); break; }   /* re-recorded at this position */
 #endif
       if (b->empty) { b->empty = 0; g_cbk_empty--; }
@@ -1053,13 +1058,13 @@ NVN(nvnCommandBufferEndRecording, NVNcommandHandle, NVNcommandBuffer *c) {
     if (cmdlog_env()) LOG("[cmd] EndRecording cb=%p recorded=%p copy=%p ctl=%p", (void *)c, (void *)o->seg, (void *)copy, o->ctl);
     if (totk_life_on() && totk_life_cb_take(c)) { totk_life_log("end cb=%p handle=%p", (void *)c, (void *)copy); totk_life_handle_add((uint64_t)(uintptr_t)copy); }
     if (getenv("TOTK_CHAIN_LOG")) { static int n; if (n++ < 200) guest_chain("EndRecording"); }
-#ifdef GAME_BOTW
+#ifdef GAME_NVN53
     if (lo) return (NVNcommandHandle)lo;
     { static uint64_t n; if (n++ < 4) LOG("[cmd] recording without room in its control memory: the handle is the copy itself (kept)"); }
 #endif
     return (NVNcommandHandle)copy;
 }
-#ifdef GAME_BOTW
+#ifdef GAME_NVN53
 /* The copy a handle names now: a control-memory position (EndRecording) is looked up; anything else is a copy itself. */
 static NVNcommandHandle botw_handle_copy(NVNcommandHandle h) {
     uint8_t *copy = NULL;
@@ -1154,7 +1159,7 @@ static void life_call(NVNcommandBuffer *c, int n, const NVNcommandHandle *h, con
 }
 NVN(nvnCommandBufferCopyCommands, void, NVNcommandBuffer *c, int n, const NVNcommandHandle *h) {
     life_call(c, n, h, "copy");
-#ifdef GAME_BOTW
+#ifdef GAME_NVN53
     for (int i = 0; i < n; i++) inline_recording(c, botw_handle_copy(h[i]));
 #else
     for (int i = 0; i < n; i++) inline_recording(c, h[i]);
@@ -1163,7 +1168,7 @@ NVN(nvnCommandBufferCopyCommands, void, NVNcommandBuffer *c, int n, const NVNcom
 NVN(nvnCommandBufferCallCommands, void, NVNcommandBuffer *c, int n, const NVNcommandHandle *h) {
     if (cmdlog_env()) for (int i = 0; i < n; i++) LOG("[cmd] CallCommands cb=%p handle=%#llx", (void *)c, (unsigned long long)h[i]);
     life_call(c, n, h, "call");
-#ifdef GAME_BOTW
+#ifdef GAME_NVN53
     for (int i = 0; i < n; i++) inline_recording(c, botw_handle_copy(h[i]));
 #else
     for (int i = 0; i < n; i++) inline_recording(c, h[i]);
@@ -2149,7 +2154,7 @@ static int fence_wait(uint64_t k, uint64_t timeout_ns) {
 
 NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h) {
     NVN_BLOCKING();
-#ifdef GAME_BOTW
+#ifdef GAME_NVN53
     NVNcommandHandle mapped[64]; NVNcommandHandle *heap = n > 64 ? malloc(sizeof *heap * (size_t)n) : NULL;
     NVNcommandHandle *hv = heap ? heap : mapped; if (n > 64 && !heap) die("submit handle table");
     for (int i = 0; i < n; i++) hv[i] = botw_handle_copy(h[i]);
@@ -2177,14 +2182,14 @@ NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h)
         j.ucap = mtl_sub_capture_ubos((const uint64_t *)h, n);
         x_push(&j);
         totk_tl(TL_SUB_OUT, 1, 0);
-#ifdef GAME_BOTW
+#ifdef GAME_NVN53
         free(heap);
 #endif
         return;
     }
     submit_exec(n, (const uint64_t *)h, NULL);
     totk_tl(TL_SUB_OUT, 0, 0);
-#ifdef GAME_BOTW
+#ifdef GAME_NVN53
     free(heap);
 #endif
 }

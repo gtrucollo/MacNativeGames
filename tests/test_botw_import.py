@@ -96,7 +96,7 @@ class BotwImport(unittest.TestCase):
         config.write_text('#define AOC_PRESENT_MASK 3')
         with patch.object(build_app, 'BOTW160', expected), patch.object(build_app, 'fonts_valid', return_value=True), \
                 patch.object(build_app, 'build_hactool') as build:
-            build_app.step_data_botw(tree, BOTW.parent, self.base, self.keys, self.root / 'logs', update=self.update)
+            build_app.step_data_botw(tree, BOTW.parent, self.base, self.keys, self.root / 'logs', 'botw160', update=self.update)
         build.assert_not_called()
         self.assertFalse(aoc.parent.exists())
         self.assertFalse(config.exists())

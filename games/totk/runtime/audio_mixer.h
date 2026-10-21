@@ -22,6 +22,7 @@ typedef struct AudioRenderer {
     AudrenParameter param;
     pthread_mutex_t lock; pthread_t thread; int running;
     uint32_t state, revision, time_limit, event; int logged;
+    float voice_drop; int voice_drop_set;   /* IAudioRenderer SetVoiceDropParameter */
     uint64_t behavior_flags, elapsed_frames;
     uint64_t stop_released, empty_played, flushed, logged_released;   /* wave buffers given back by Stop / without samples / by FlushWaveBuffers */
     ServerVoice *voices; AudrenPoolIn *pools; AudrenMixIn *mixes; AudrenSinkIn *sinks; AudrenEffectIn *effects; AudrenChannelIn *channels;

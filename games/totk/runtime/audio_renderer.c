@@ -310,6 +310,8 @@ static void renderer_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *r
     case 7: rs->copy[rs->ncopy++] = runtime_event_readable(r->event); return;
     case 8: r->time_limit = IPC_ARG(rq, uint32_t, 0); return;
     case 9: { uint32_t v = r->time_limit ? r->time_limit : 100; IPC_OUT(rs, v); return; }
+    case 12: r->voice_drop = IPC_ARG(rq, float, 0); r->voice_drop_set = 1; return;   /* SetVoiceDropParameter (SDK 8 and later; Breath of the Wild 1.9.0) */
+    case 13: { float v = r->voice_drop_set ? r->voice_drop : 1.0f; IPC_OUT(rs, v); return; }
     default: ipc_unimplemented(s, rq);
     }
 }
